@@ -441,6 +441,28 @@ def create_app(router: Optional[Any] = None):
         finally:
             admission.release()
 
+    def _parse_elt(body) -> dict:
+        state = body.get("state")
+        questions = body["questions"]
+        _check_request_limits(state, questions)
+        model = _resolve_model(body.get("model"))
+
+        max_budget_cap = _resolve_max_token_budget()
+        max_len = _validate_budget_param(body, "max_len", max_budget_cap)
+        head_max_len = _validate_budget_param(body, "head_max_len", max_budget_cap)
+        predict_kwargs = {}
+        if max_len is not None:
+            predict_kwargs["max_len"] = max_len
+        if head_max_len is not None:
+            predict_kwargs["head_max_len"] = head_max_len
+
+        return {
+            "state": state,
+            "questions": questions,
+            "model": model,
+            **predict_kwargs,
+        }
+
     async def _systemone_inner(request: Request):
         nonlocal gate
         # A declared length over the cap is rejected before anything is read; the
@@ -461,20 +483,16 @@ def create_app(router: Optional[Any] = None):
             body = json.loads(raw)
         except (ValueError, RecursionError):
             raise HTTPException(status_code=400, detail="request body must be valid JSON")
-        if not isinstance(body, dict) or "questions" not in body:
+
+        batch = False
+        if isinstance(body, list):
+            kwargs = {"requests": [_parse_elt(e) for e in body]}
+            batch = True
+        elif not isinstance(body, dict) or "questions" not in body:
             raise HTTPException(status_code=400, detail="request body must be an object with a 'questions' field")
-        state = body.get("state")
-        questions = body["questions"]
-        _check_request_limits(state, questions)
-        model = _resolve_model(body.get("model"))
-        max_budget_cap = _resolve_max_token_budget()
-        max_len = _validate_budget_param(body, "max_len", max_budget_cap)
-        head_max_len = _validate_budget_param(body, "head_max_len", max_budget_cap)
-        predict_kwargs = {}
-        if max_len is not None:
-            predict_kwargs["max_len"] = max_len
-        if head_max_len is not None:
-            predict_kwargs["head_max_len"] = head_max_len
+        else:
+            kwargs = _parse_elt(body)
+
         if gate is None:
             gate = asyncio.Lock()
         try:
@@ -483,12 +501,14 @@ def create_app(router: Optional[Any] = None):
             async with gate:
                 loop = asyncio.get_running_loop()
                 t0 = time.perf_counter()
-                if predict_kwargs:
-                    result = await loop.run_in_executor(
-                        pool, lambda: router.predict(state, questions, model=model, **predict_kwargs))
+
+                if batch:
+                    predictor = router.predict_batch
                 else:
-                    result = await loop.run_in_executor(
-                        pool, lambda: router.predict(state, questions, model=model))
+                    predictor = router.predict
+
+                result = await loop.run_in_executor(
+                    pool, lambda: predictor(**kwargs))
                 infer_ms = (time.perf_counter() - t0) * 1000.0
                 from fastapi.responses import JSONResponse
                 return JSONResponse(
@@ -511,8 +531,6 @@ def create_app(router: Optional[Any] = None):
             # `model` is caller-supplied text. `_resolve_model` has already reduced it to a
             # shipped checkpoint name or None, and the line breaks are replaced so a crafted
             # value cannot forge log entries (py/log-injection) if that ever stops holding.
-            _log.exception("inference failed for model=%s",
-                           str(model).replace("\n", "\\n").replace("\r", "\\r"))
             raise HTTPException(status_code=500, detail="inference failed")
 
     return app
